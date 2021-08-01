@@ -31,6 +31,7 @@ func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
 func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 func createId(n int) string {
+	rand.Seed(time.Now().UnixNano())
 	var letters = []rune("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
 
 	s := make([]rune, n)
@@ -92,8 +93,11 @@ func (w *WorkerInfo) MapHandler(taskInfo *TaskInfo, nReduce int)  {
 	// Defer the function to close the output files
 	defer func() {
 		for idx, ofile:= range mapOutput {
+			oldfilename:= ofile.Name()
+			newfilename:= w.outputFileName(taskInfo.Id, idx)
 			_ = ofile.Close()
-			err := os.Rename(ofile.Name(), w.outputFileName(taskInfo.Id, idx))
+			log.Printf("Renaming file %s to %s\n", oldfilename, newfilename)
+			err := os.Rename(oldfilename, newfilename)
 			if err != nil {
 				log.Fatalf("Failed to rename the output file")
 			}
@@ -188,8 +192,6 @@ func (w *WorkerInfo) PollCoordinator() {
 		taskInfo, nReduce, nMap := CallAllocateTask(w.id)
 		if taskInfo != nil {
 			w.ProcessTask(taskInfo, nReduce, nMap)
-		} else {
-			break
 		}
 	}
 }
@@ -225,7 +227,7 @@ func CallAllocateTask(workerId string) (*TaskInfo, int, int) {
 	}
 
 	// Print the received task
-	fmt.Printf("Recived Task %v , nReduce %d\n", resp.TaskInfo, resp.NReduce)
+	log.Printf("Recived Task %v , nReduce %d\n", resp.TaskInfo, resp.NReduce)
 
 	return resp.TaskInfo, resp.NReduce, resp.NMap
 }
