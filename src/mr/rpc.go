@@ -1,29 +1,52 @@
 package mr
 
-//
-// RPC definitions.
-//
-// remember to capitalize all names.
-//
+/*
+RPC definitions.
+*/
 
 import "os"
 import "strconv"
 
-//
-// example to show how to declare the arguments
-// and reply for an RPC.
-//
+type TaskType int
+type Status int
 
-type ExampleArgs struct {
-	X int
+const (
+	MAP TaskType = iota
+	REDUCE
+)
+
+const (
+	SUCCESS Status = iota
+	FAILED
+	RUNNING
+	PENDING
+)
+
+type TaskInfo struct {
+	TaskType  TaskType
+	Id        int
+	InputPath string
 }
 
-type ExampleReply struct {
-	Y int
+type AllocateTaskReq struct {
+	WorkerId string
+}
+
+type AllocateTaskResp struct {
+	TaskInfo *TaskInfo
+	NReduce int
+	NMap int
+}
+
+type FinishTaskReq struct {
+	TaskInfo   *TaskInfo
+}
+
+type FinishTaskResp struct {
+	// None
 }
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
