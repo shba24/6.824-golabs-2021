@@ -77,8 +77,8 @@ const (
 
 const (
 	IsDebuggingEnabled = false
-	ElectionTimeout    = time.Millisecond * 500
-	HeartbeatTimeout   = time.Millisecond * 200
+	ElectionTimeout    = time.Millisecond * 300
+	HeartbeatTimeout   = time.Millisecond * 150
 )
 
 type LogEntry struct {
@@ -100,7 +100,8 @@ type Raft struct {
 	state           State               // Current state of the raft node
 	electionTicker  *time.Ticker        // Ticker for election timeout
 	heartBeatTicker *time.Ticker        // Ticker for heartbeat
-	stateCond       *sync.Cond          // Condition for any state change, with [mu] as internal mutex
+	leaderCond      *sync.Cond          // Condition for state change to LEADER, with [mu] as internal mutex
+	followerCond	*sync.Cond			// Condition for state change to FOLLOWER, with [mu] as internal mutex
 
 	// Volatile data structure
 	commitIndex int // Index of the highest log entry known to be committed, initialized 0
@@ -146,7 +147,11 @@ func (rf *Raft) changeStateWithoutLock(newState State) {
 	}
 	rf.state = newState
 	log.Printf("[%d] Updated state to: [%d]", rf.me, rf.state)
-	rf.stateCond.Signal()
+	if newState == LEADER {
+		rf.leaderCond.Signal()
+	} else if newState == FOLLOWER {
+		rf.followerCond.Signal()
+	}
 }
 
 func (rf *Raft) AppointLeader() {
@@ -195,11 +200,10 @@ believes it is the leader.
 */
 func (rf *Raft) GetState() (int, bool) {
 	var term int
-	var isLeader bool
+	isLeader:= false
 	rf.Lock("GetState::1")
 	defer rf.Unlock("GetState::1")
 	term = rf.currentTerm
-	isLeader = false
 	log.Printf("[%d] State: [%d] Term: [%d]", rf.me, rf.state, rf.currentTerm)
 	if rf.state == LEADER {
 		isLeader = true
@@ -480,6 +484,10 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) CallRequestVote(idx int, req *RequestVoteArgs, voteCh chan bool) {
+	globalTimeoutTicker := time.NewTicker(300 * time.Millisecond)
+	apiTimeoutTicker := time.NewTicker(100 * time.Millisecond)
+	defer globalTimeoutTicker.Stop()
+	defer apiTimeoutTicker.Stop()
 	for !rf.killed() {
 		rf.Lock("CallRequestVote::1")
 		if rf.state != CANDIDATE || req.Term != rf.currentTerm {
@@ -487,9 +495,10 @@ func (rf *Raft) CallRequestVote(idx int, req *RequestVoteArgs, voteCh chan bool)
 			return
 		}
 		rf.Unlock("CallRequestVote::1")
-		apiTimeoutTicker := time.NewTicker(100 * time.Millisecond)
 		var resp RequestVoteReply
 		endCh := make(chan bool, 1)
+		apiTimeoutTicker.Stop()
+		apiTimeoutTicker.Reset(100 * time.Millisecond)
 		go func() {
 			ok := rf.sendRequestVote(idx, req, &resp)
 			if !ok {
@@ -499,6 +508,8 @@ func (rf *Raft) CallRequestVote(idx int, req *RequestVoteArgs, voteCh chan bool)
 		}()
 
 		select {
+		case <- globalTimeoutTicker.C:
+			return
 		case ok := <-endCh:
 			if !ok {
 				continue
@@ -535,7 +546,8 @@ func (rf *Raft) TriggerElection(req *RequestVoteArgs) {
 		}
 		go rf.CallRequestVote(i, req, voteCh)
 	}
-	fullTimeoutTicker := time.NewTicker(100 * time.Millisecond)
+	fullTimeoutTicker := time.NewTicker(300 * time.Millisecond)
+	defer fullTimeoutTicker.Stop()
 	for !rf.killed() {
 		select {
 		case vote:= <-voteCh:
@@ -553,18 +565,12 @@ func (rf *Raft) TriggerElection(req *RequestVoteArgs) {
 		break
 	}
 
-	rf.Lock("TriggerElection::1")
-	// If in the middle of election, this node became the follower
-	// there is no point in continuing with this election as somebody
-	// else with greater term has already been identified and we have already given up
-	if rf.state != CANDIDATE || req.Term != rf.currentTerm {
-		return
-	}
-	rf.Unlock("TriggerElection::1")
-
 	if inFavour > len(rf.peers)/2 {
 		log.Printf("[%d] Received majority votes: %d out of %d", rf.me, inFavour, totalVotes)
 		rf.Lock("TriggerElection::2")
+		// If in the middle of election, this node became the follower
+		// there is no point in continuing with this election as somebody
+		// else with greater term has already been identified and we have already given up
 		if rf.state == CANDIDATE && req.Term == rf.currentTerm {
 			rf.AppointLeader()
 			rf.resetHeartbeatTimer()
@@ -584,7 +590,7 @@ func (rf *Raft) ElectionTicker() {
 		<-rf.electionTicker.C
 		rf.Lock("ElectionTicker::1")
 		if rf.state == LEADER {
-			rf.stateCond.Wait()
+			rf.followerCond.Wait()
 			rf.Unlock("ElectionTicker::1")
 		} else {
 			rf.resetElectionTimer()
@@ -609,6 +615,10 @@ func (rf *Raft) ElectionTicker() {
 }
 
 func (rf *Raft) SendHeartBeat(idx int, req *AppendEntriesArgs) {
+	globalTimeoutTicker := time.NewTicker(200 * time.Millisecond)
+	apiTimeoutTicker := time.NewTicker(100 * time.Millisecond)
+	defer globalTimeoutTicker.Stop()
+	defer apiTimeoutTicker.Stop()
 	for rf.killed() == false {
 		rf.Lock("SendHeartBeat::1")
 		if rf.state != LEADER {
@@ -617,18 +627,22 @@ func (rf *Raft) SendHeartBeat(idx int, req *AppendEntriesArgs) {
 		}
 		rf.Unlock("SendHeartBeat::1")
 
-		apiTimeoutTicker := time.NewTicker(100 * time.Millisecond)
 		endCh := make(chan bool, 1)
 		var resp AppendEntriesReply
 		/*
 			This code segment can get stuck because of RPC call taking too much time to
 			return from the server side. We need to have a timeout here to move the overall heartbeat thread.
 		*/
+		apiTimeoutTicker.Stop()
+		apiTimeoutTicker.Reset(100 * time.Millisecond)
 		go func() {
-			endCh <- rf.sendAppendEntries(idx, req, &resp)
+			ok := rf.sendAppendEntries(idx, req, &resp)
+			endCh <- ok
 		}()
 
 		select {
+		case <- globalTimeoutTicker.C:
+			return
 		case <-apiTimeoutTicker.C:
 			continue
 		case ok := <-endCh:
@@ -648,6 +662,8 @@ func (rf *Raft) SendHeartBeat(idx int, req *AppendEntriesArgs) {
 			rf.persist()
 			rf.resetElectionTimer()
 			rf.AppointFollower()
+			rf.Unlock("SendHeartBeat::1")
+			return
 		}
 		rf.Unlock("SendHeartBeat::1")
 		// TODO: Add usage of resp for lab B,C,D
@@ -664,7 +680,6 @@ func (rf *Raft) HeartBeatTicker() {
 		<-rf.heartBeatTicker.C
 		rf.Lock("HeartBeatTicker::1")
 		if rf.state == LEADER {
-			rf.resetHeartbeatTimer()
 			lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
 			req := &AppendEntriesArgs{
 				Term:         rf.currentTerm,
@@ -684,8 +699,9 @@ func (rf *Raft) HeartBeatTicker() {
 					go rf.SendHeartBeat(i, req)
 				}
 			}()
+			rf.resetHeartbeatTimer()
 		} else {
-			rf.stateCond.Wait()
+			rf.leaderCond.Wait()
 			rf.Unlock("Unlocked state condition")
 		}
 	}
@@ -716,7 +732,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.applyCh = applyCh
 	rf.state = FOLLOWER
-	rf.stateCond = sync.NewCond(&rf.mu)
+	rf.leaderCond = sync.NewCond(&rf.mu)
+	rf.followerCond = sync.NewCond(&rf.mu)
 	rf.nextIndex = nil
 	rf.matchIndex = nil
 	rf.currentTerm = 0
