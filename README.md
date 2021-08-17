@@ -3,5 +3,5 @@
 - [x] Lab 1: MapReducer
 - [X] Lab 2A: Raft - Leader Election
 - [x] Lab 2B: Raft - Log
-- [ ] Lab 2C: Raft - Persistence
+- [x] Lab 2C: Raft - Persistence
 - [ ] Lab 2D: Raft - Log Compaction

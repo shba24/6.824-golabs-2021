@@ -86,11 +86,11 @@ const (
 	IsDebuggingEnabled = false
 	ElectionTimeout    = time.Millisecond * 300
 	/*
-	Lab 2B test TestRPCBytes2B has a problem with properly testing the
-	number of bytes. If we send the heartbeat too frequently, then test might
-	see more bytes than expected which is stupidly hard coded in the tests.
+		Lab 2B test TestRPCBytes2B has a problem with properly testing the
+		number of bytes. If we send the heartbeat too frequently, then test might
+		see more bytes than expected which is stupidly hard coded in the tests.
 	*/
-	HeartbeatTimeout   = time.Millisecond * 200
+	HeartbeatTimeout = time.Millisecond * 200
 )
 
 type LogEntry struct {
@@ -99,8 +99,8 @@ type LogEntry struct {
 }
 
 type AppendLogMsg struct {
-	index	int
-	cmd		interface{}
+	index int
+	cmd   interface{}
 }
 
 /*
@@ -117,9 +117,9 @@ type Raft struct {
 	state           State               // Current state of the raft node
 	electionTicker  *time.Ticker        // Ticker for election timeout
 	heartBeatTicker *time.Ticker        // Ticker for heartbeat
-	appendLogCh		chan bool			// channel to tell asynchronously about commit index update
+	appendLogCh     chan bool           // channel to tell asynchronously about commit index update
 	leaderCond      *sync.Cond          // Condition for state change to LEADER, with [mu] as internal mutex
-	followerCond	*sync.Cond			// Condition for state change to FOLLOWER, with [mu] as internal mutex
+	followerCond    *sync.Cond          // Condition for state change to FOLLOWER, with [mu] as internal mutex
 
 	// Volatile data structure
 	commitIndex int // Index of the highest log entry known to be committed in local logs, initialized 0
@@ -181,7 +181,6 @@ func (rf *Raft) AppointLeader() {
 		rf.nextIndex[i] = len(rf.logs)
 		rf.matchIndex[i] = 0
 	}
-	rf.resetElectionTimer()
 }
 
 func (rf *Raft) AppointFollower() {
@@ -218,7 +217,7 @@ believes it is the leader.
 */
 func (rf *Raft) GetState() (int, bool) {
 	var term int
-	isLeader:= false
+	isLeader := false
 	rf.Lock("GetState::1")
 	defer rf.Unlock("GetState::1")
 	term = rf.currentTerm
@@ -333,6 +332,7 @@ Field names must start with capital letters!
 type AppendEntriesReply struct {
 	Term    int  // Leader's term id
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
+	NextIdx int  // Next not matching index
 }
 
 /*
@@ -358,7 +358,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.resetElectionTimer()
 		}
 	} else if args.Term == rf.currentTerm {
-		log.Printf("[%d] votedFor : %d, args.CandidateId: %d, lastLogTerm: %d, " +
+		log.Printf("[%d] votedFor : %d, args.CandidateId: %d, lastLogTerm: %d, "+
 			"args.LastLogTerm: %d, lastLogIndex: %d, args.LastLogIdx: %d", rf.me, rf.votedFor, args.CandidateId,
 			lastLogTerm, args.LastLogTerm, lastLogIndex, args.LastLogIdx)
 		if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) &&
@@ -382,6 +382,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 /*
+getNextLogIndex
+Returns next log index not matching with Leader and to be sent as
+AppendEntries response.
+*/
+func (rf *Raft) getNextLogIndex(args *AppendEntriesArgs) (nextLogIndex int) {
+	_, lastLogIndex := rf.lastLogTermIndex()
+	if lastLogIndex < args.PrevLogIndex {
+		nextLogIndex = lastLogIndex + 1
+	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		termNeeded := rf.logs[args.PrevLogIndex].Term
+		for i := args.PrevLogIndex; i > 0; i-- {
+			if rf.logs[i].Term != termNeeded {
+				break
+			}
+			nextLogIndex = i
+		}
+	}
+	return nextLogIndex
+}
+
+/*
 AppendEntries
 
 RPC for requesting to append the log entries by the leader
@@ -389,10 +410,6 @@ RPC for requesting to append the log entries by the leader
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.Lock("AppendEntries::1")
 	defer rf.Unlock("AppendEntries::1")
-	if rf.state == LEADER {
-		reply.Success = false
-		reply.Term = rf.currentTerm
-	}
 	_, lastLogIndex := rf.lastLogTermIndex()
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -400,34 +417,26 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	} else if (lastLogIndex < args.PrevLogIndex) ||
 		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
 		// We need more old entries
-		rf.resetElectionTimer()
+		reply.NextIdx = rf.getNextLogIndex(args)
 		reply.Success = false
 		reply.Term = args.Term
-	} else {
+		rf.AppointFollower()
 		rf.resetElectionTimer()
-
-		for i:=args.PrevLogIndex+1; i<=args.PrevLogIndex+len(args.Entries); i++ {
-			if len(rf.logs) <= i {
-				rf.logs = append(rf.logs, args.Entries[i-args.PrevLogIndex-1])
-			} else {
-				rf.logs[i] = args.Entries[i-args.PrevLogIndex-1]
-			}
-		}
-
-		// Remove all extra entries
-		rf.logs = rf.logs[:args.PrevLogIndex+len(args.Entries)+1]
-
+	} else if args.Term >= rf.currentTerm {
+		rf.resetElectionTimer()
+		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
 		if args.Term > rf.currentTerm {
 			rf.currentTerm = args.Term
 			rf.votedFor = args.LeaderId
 			rf.AppointFollower()
 		}
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(len(rf.logs)-1, args.LeaderCommit)
+			rf.commitIndex = min(lastLogIndex, args.LeaderCommit)
 			rf.appendLogCh <- true
 		}
 		reply.Success = true
 		reply.Term = rf.currentTerm
+		reply.NextIdx = len(rf.logs)
 	}
 	// Persist in the file system
 	rf.persist()
@@ -559,7 +568,7 @@ func (rf *Raft) CallRequestVote(idx int, req *RequestVoteArgs, voteCh chan bool)
 		}()
 
 		select {
-		case <- globalTimeoutTicker.C:
+		case <-globalTimeoutTicker.C:
 			return
 		case ok := <-endCh:
 			if !ok {
@@ -601,7 +610,7 @@ func (rf *Raft) TriggerElection(req *RequestVoteArgs) {
 	defer fullTimeoutTicker.Stop()
 	for !rf.killed() {
 		select {
-		case vote:= <-voteCh:
+		case vote := <-voteCh:
 			totalVotes++
 			if vote {
 				inFavour++
@@ -610,7 +619,7 @@ func (rf *Raft) TriggerElection(req *RequestVoteArgs) {
 				break
 			}
 			continue
-		case <- fullTimeoutTicker.C:
+		case <-fullTimeoutTicker.C:
 			return
 		}
 		break
@@ -674,7 +683,7 @@ func (rf *Raft) getPrevLogEntries(idx int) (prevLogTerm int, prevLogIndex int, e
 		prevLogTerm = lastLogTerm
 		return prevLogTerm, prevLogIndex, nil
 	}
-	for i:=prevLogIndex+1; i<len(rf.logs); i++ {
+	for i := prevLogIndex + 1; i < len(rf.logs); i++ {
 		entries = append(entries, rf.logs[i])
 	}
 	return prevLogTerm, prevLogIndex, entries
@@ -716,7 +725,7 @@ func (rf *Raft) SendHeartBeat(idx int) {
 		}()
 
 		select {
-		case <- globalTimeoutTicker.C:
+		case <-globalTimeoutTicker.C:
 			return
 		case <-apiTimeoutTicker.C:
 			continue
@@ -731,7 +740,7 @@ func (rf *Raft) SendHeartBeat(idx int) {
 
 		rf.Lock("SendHeartBeat::1")
 		if resp.Term > rf.currentTerm {
-			log.Printf("[%d] Received greater term, going to submission", rf.me)
+			log.Printf("[%d] Received greater term from: %d", rf.me, idx)
 			rf.currentTerm = resp.Term
 			rf.persist()
 			rf.resetElectionTimer()
@@ -750,14 +759,21 @@ func (rf *Raft) SendHeartBeat(idx int) {
 		// We will just send the appropriate signal to some background thread which will
 		// do it asynchronously for this raft node
 		if resp.Success {
-			rf.nextIndex[idx] = req.PrevLogIndex + len(req.Entries) + 1
-			rf.matchIndex[idx] = req.PrevLogIndex + len(req.Entries)
+			/*
+				Next Index for the Leader will always be moving forward
+				and will never go backwards. Any response showing NextIdx
+				less than the current nextIndex is old response which can be
+				neglected.
+			*/
+			if rf.nextIndex[idx] < resp.NextIdx {
+				rf.nextIndex[idx] = resp.NextIdx
+				rf.matchIndex[idx] = resp.NextIdx - 1
+			}
 			rf.appendLogCh <- true
 			rf.Unlock("SendHeartBeat::1")
 			return
 		} else {
-			log.Printf("[%d] Received Failure", rf.me)
-			rf.nextIndex[idx] = max(rf.nextIndex[idx]-1, 0)
+			rf.nextIndex[idx] = max(resp.NextIdx, 1)
 		}
 
 		rf.Unlock("SendHeartBeat::1")
@@ -802,31 +818,34 @@ will help with exit. Also, if there are concurrent threads
 it may interfere with each other's operations
 */
 func (rf *Raft) appendLogs() {
-	appendLogTicker := time.NewTicker(300 * time.Millisecond)
+	appendLogTicker := time.NewTicker(200 * time.Millisecond)
 	for !rf.killed() {
 		select {
 		case <-rf.appendLogCh:
 			rf.Lock("appendLogs::1")
-			var msgs []ApplyMsg
-			// Check if commit index is increased
 			oldCommitIdx := rf.commitIndex
-			newCommitIdx := len(rf.logs)-1
-			for commitIdx:=oldCommitIdx+1; commitIdx<=newCommitIdx; commitIdx++ {
-				cnt:= 0
+			// Check if commit index is increased
+			for commitIdx := rf.commitIndex + 1; commitIdx < len(rf.logs); commitIdx++ {
+				cnt := 0
 				for _, nodeCommitIdx := range rf.matchIndex {
 					if nodeCommitIdx >= commitIdx {
 						cnt++
+						if cnt > len(rf.peers)/2 {
+							if rf.currentTerm == rf.logs[commitIdx].Term {
+								rf.commitIndex = commitIdx
+							}
+							break
+						}
 					}
 				}
 				if cnt <= len(rf.peers)/2 {
-					rf.commitIndex = commitIdx-1
 					break
 				}
-				if commitIdx == newCommitIdx {
-					rf.commitIndex = commitIdx
-				}
 			}
-
+			if oldCommitIdx != rf.commitIndex {
+				log.Printf("[%d] Updated Commit Index: %d", rf.me, rf.commitIndex)
+			}
+			var msgs []ApplyMsg
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 				msgs = append(msgs, ApplyMsg{
 					CommandValid: true,
