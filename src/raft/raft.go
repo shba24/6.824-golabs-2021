@@ -121,6 +121,12 @@ type Raft struct {
 	leaderCond      *sync.Cond          // Condition for state change to LEADER, with [mu] as internal mutex
 	followerCond    *sync.Cond          // Condition for state change to FOLLOWER, with [mu] as internal mutex
 
+	// Snapshot data structures: Non-Volatile
+	snapshot		[]byte				// Content of the snapshot
+	installSnapshot		bool			// flag for apply log goroutine to look at to send snapshot to the service
+	lastSnapshotTerm	int				// Last log term in the snapshot
+	lastSnapshotIndex	int				// Last log index (included) in the snapshot, log entries will contain remaining log entries
+
 	// Volatile data structure
 	commitIndex int // Index of the highest log entry known to be committed in local logs, initialized 0
 	lastApplied int // Index of the highest log entry applied to state machine or notified to service about via applyCh, initialized 0
@@ -178,7 +184,7 @@ func (rf *Raft) AppointLeader() {
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
 	for i := 0; i < len(rf.peers); i++ {
-		rf.nextIndex[i] = len(rf.logs)
+		rf.nextIndex[i] = len(rf.logs) + rf.lastSnapshotIndex + 1
 		rf.matchIndex[i] = 0
 	}
 }
@@ -190,8 +196,11 @@ func (rf *Raft) AppointFollower() {
 }
 
 func (rf *Raft) lastLogTermIndex() (int, int) {
-	index := len(rf.logs) - 1
-	term := rf.logs[index].Term
+	index := len(rf.logs) + rf.lastSnapshotIndex
+	term := rf.lastSnapshotTerm
+	if len(rf.logs) != 0 {
+		term = rf.logs[len(rf.logs)-1].Term
+	}
 	return term, index
 }
 
@@ -240,8 +249,11 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.logs)
+	e.Encode(rf.lastSnapshotIndex)
+	e.Encode(rf.lastSnapshotTerm)
+	e.Encode(rf.installSnapshot)
 	data := w.Bytes()
-	rf.persister.SaveRaftState(data)
+	rf.persister.SaveStateAndSnapshot(data, rf.snapshot)
 }
 
 /*
@@ -254,40 +266,25 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
-	var currentTerm, votedFor int
+	var currentTerm, votedFor, lastSnapshotIndex, lastSnapshotTerm int
+	var installSnapshot bool
 	var logs []LogEntry
 	if d.Decode(&currentTerm) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&logs) != nil {
+		d.Decode(&logs) != nil ||
+		d.Decode(&lastSnapshotIndex) != nil ||
+		d.Decode(&lastSnapshotTerm) != nil ||
+		d.Decode(&installSnapshot) != nil {
 		log.Fatalln("Failed to decode from persistent storage.")
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.logs = logs
+		rf.lastSnapshotIndex = lastSnapshotIndex
+		rf.lastSnapshotTerm = lastSnapshotTerm
+		rf.installSnapshot = installSnapshot
+		rf.snapshot = rf.persister.ReadSnapshot()
 	}
-}
-
-/*
-CondInstallSnapshot
-A service wants to switch to snapshot.  Only do so if Raft hasn't had
-more recent info since it communicate the snapshot on applyCh.
-*/
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-/*
-Snapshot
-The service says it has created a snapshot that has
-all info up to and including index. this means the
-service no longer needs the log through (and including)
-that index. Raft should now trim its log as much as possible.*/
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
 }
 
 /*
@@ -333,6 +330,75 @@ type AppendEntriesReply struct {
 	Term    int  // Leader's term id
 	Success bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 	NextIdx int  // Next not matching index
+}
+
+/*
+InstallSnapshotArgs
+Fields names must start with capital letters!
+*/
+type InstallSnapshotArgs struct {
+	Term				int			// Leader's term id
+	LeaderId			int			// Followers can use this to redirect clients
+	LastIncludedIndex 	int			// Index of log entry in the snapshot, used to check consistency of the snapshot
+	LastIncludedTerm  	int			// Term of the LastIncludedIndex, used to check consistency of the snapshot
+	Snapshot      		[]byte		// snapshot raw data
+	LeaderCommit 		int			// Leader's commit index, used to tell where to insert these entries
+}
+
+/*
+InstallSnapshotReply
+Fields names must start with capital letters!
+*/
+type InstallSnapshotReply struct {
+	Term    int  // Leader's term id
+}
+
+/*
+InstallSnapshot
+
+Raft leaders must sometimes tell lagging Raft peers to update
+their state by installing a snapshot. So sometimes leader will
+call this RPC to ask its followers to install a particular
+snapshot on its raft node.
+
+When a follower receives and handles an InstallSnapshot RPC,
+it must hand the included snapshot to the service using Raft.
+The InstallSnapshot handler can use the applyCh to send the
+snapshot to the service, by putting the snapshot in ApplyMsg.
+*/
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.Lock("InstallSnapshot::1")
+	defer rf.Unlock("InstallSnapshot::1")
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		return
+	} else if args.Term >= rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.AppointFollower()
+		rf.resetElectionTimer()
+	}
+
+	// Ignore old snapshots
+	if rf.lastSnapshotIndex >= args.LastIncludedIndex {
+		reply.Term = args.Term
+	} else {
+		_, lastLogIndex := rf.lastLogTermIndex()
+		if lastLogIndex <= args.LastIncludedIndex {
+			rf.logs = []LogEntry{}
+			if rf.matchIndex != nil {
+				rf.matchIndex[rf.me] = args.LastIncludedIndex
+			}
+		} else {
+			rf.logs = rf.logs[args.LastIncludedIndex+1:]
+		}
+		rf.lastSnapshotIndex = args.LastIncludedIndex
+		rf.lastSnapshotTerm = args.LastIncludedTerm
+		rf.snapshot = args.Snapshot
+		rf.installSnapshot = true
+		rf.appendLogCh <- true
+	}
+	// Persist
+	rf.persist()
 }
 
 /*
@@ -382,27 +448,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 /*
-getNextLogIndex
-Returns next log index not matching with Leader and to be sent as
-AppendEntries response.
-*/
-func (rf *Raft) getNextLogIndex(args *AppendEntriesArgs) (nextLogIndex int) {
-	_, lastLogIndex := rf.lastLogTermIndex()
-	if lastLogIndex < args.PrevLogIndex {
-		nextLogIndex = lastLogIndex + 1
-	} else if rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
-		termNeeded := rf.logs[args.PrevLogIndex].Term
-		for i := args.PrevLogIndex; i > 0; i-- {
-			if rf.logs[i].Term != termNeeded {
-				break
-			}
-			nextLogIndex = i
-		}
-	}
-	return nextLogIndex
-}
-
-/*
 AppendEntries
 
 RPC for requesting to append the log entries by the leader
@@ -414,29 +459,62 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Success = false
 		reply.Term = rf.currentTerm
-	} else if (lastLogIndex < args.PrevLogIndex) ||
-		rf.logs[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return
+	}
+
+	reply.Term = args.Term
+	if rf.currentTerm < args.Term {
+		rf.votedFor = args.LeaderId
+	}
+	rf.currentTerm = args.Term
+	rf.AppointFollower()
+	rf.resetElectionTimer()
+	if lastLogIndex < args.PrevLogIndex {
 		// We need more old entries
-		reply.NextIdx = rf.getNextLogIndex(args)
+		reply.NextIdx = lastLogIndex + 1
 		reply.Success = false
-		reply.Term = args.Term
-		rf.AppointFollower()
-		rf.resetElectionTimer()
-	} else if args.Term >= rf.currentTerm {
-		rf.resetElectionTimer()
-		rf.logs = append(rf.logs[:args.PrevLogIndex+1], args.Entries...)
-		if args.Term > rf.currentTerm {
-			rf.currentTerm = args.Term
-			rf.votedFor = args.LeaderId
-			rf.AppointFollower()
+	} else if args.PrevLogIndex<rf.lastSnapshotIndex {
+		// Requesting for append logs in snapshot range
+		// It's not possible in general case. Not sure if it's possible at all.
+		// Here we will just ask for logs entries just next to the end of snapshot
+		reply.NextIdx = rf.lastSnapshotIndex+1
+		reply.Success = false
+	} else if args.PrevLogIndex==rf.lastSnapshotIndex {
+		if args.PrevLogTerm != rf.lastSnapshotTerm {
+			// Again, should not happen, but just in case
+			reply.NextIdx = 1
+			reply.Success = false
+		} else {
+			rf.logs = args.Entries
+			reply.Success = true
+			reply.NextIdx = len(rf.logs) + rf.lastSnapshotIndex + 1
+			if args.LeaderCommit > rf.commitIndex {
+				_, lastLogIdx := rf.lastLogTermIndex()
+				rf.commitIndex = min(lastLogIdx, args.LeaderCommit)
+				rf.appendLogCh <- true
+			}
 		}
+	} else if rf.logs[args.PrevLogIndex-rf.lastSnapshotIndex-1].Term != args.PrevLogTerm {
+		// We need more old entries
+		nextLogIndex := rf.lastSnapshotIndex+1
+		termNeeded := rf.logs[args.PrevLogIndex-rf.lastSnapshotIndex-1].Term
+		for i := args.PrevLogIndex; i > rf.lastSnapshotIndex && i > rf.commitIndex; i-- {
+			if rf.logs[i-rf.lastSnapshotIndex-1].Term != termNeeded {
+				break
+			}
+			nextLogIndex = i
+		}
+		reply.NextIdx = nextLogIndex
+		reply.Success = false
+	} else {
+		rf.logs = append(rf.logs[:args.PrevLogIndex-rf.lastSnapshotIndex], args.Entries...)
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(lastLogIndex, args.LeaderCommit)
+			_, lastLogIdx := rf.lastLogTermIndex()
+			rf.commitIndex = min(lastLogIdx, args.LeaderCommit)
 			rf.appendLogCh <- true
 		}
 		reply.Success = true
-		reply.Term = rf.currentTerm
-		reply.NextIdx = len(rf.logs)
+		reply.NextIdx = len(rf.logs) + rf.lastSnapshotIndex + 1
 	}
 	// Persist in the file system
 	rf.persist()
@@ -483,6 +561,96 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 	return ok
 }
 
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok:= rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+/*
+Snapshot
+
+The service using Raft (e.g. a k/v server) wants Raft to cooperate
+with them to save space. This interface will be used by the service
+for that particular use case where from time to time service will
+persistently store a "snapshot" of its current state, and call this
+RPC and Raft will discard log entries that precede the snapshot and
+store the identity or content of snapshot for it to be replicated
+instead of the explicit log entries this snapshot comprises.
+
+A service calls Snapshot() to communicate the snapshot of its state
+to Raft. The snapshot includes all info up to and including index.
+This means the corresponding Raft peer no longer needs the log through
+(and including) index. Your Raft implementation should trim its log
+as much as possible.
+*/
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	rf.Lock("Snapshot::1")
+	defer rf.Unlock("Snapshot::1")
+
+	// No point in consuming an old snapshot
+	if index <= rf.lastSnapshotIndex {
+		return
+	}
+
+	// We can't go over the current log limits as well
+	if index > len(rf.logs)+rf.lastSnapshotIndex {
+		panic("Gone overboard with the snapshot.")
+	}
+
+	_, lastLogIndex := rf.lastLogTermIndex()
+	newLastSnapshotTerm := rf.logs[index-rf.lastSnapshotIndex-1].Term
+	newLastSnapshotIndex := index
+	if lastLogIndex > index {
+		rf.logs = rf.logs[index-rf.lastSnapshotIndex:]
+	} else {
+		// As no remaining log entries
+		rf.logs = []LogEntry{}
+	}
+	rf.snapshot = snapshot
+	rf.lastSnapshotTerm = newLastSnapshotTerm
+	rf.lastSnapshotIndex = newLastSnapshotIndex
+	if rf.nextIndex!=nil {
+		rf.nextIndex[rf.me] = len(rf.logs) + rf.lastSnapshotIndex + 1
+	}
+	// Persist
+	rf.persist()
+}
+
+/*
+CondInstallSnapshot
+
+A service wants to switch to snapshot. Only do so if Raft hasn't had
+more recent info since it communicate the snapshot on applyCh.
+
+The service reads from applyCh, and invokes CondInstallSnapshot with
+the snapshot to tell Raft that the service is switching to the
+passed-in snapshot state, and that Raft should update its log at
+the same time.
+
+CondInstallSnapshot should refuse to install a snapshot if it is
+an old snapshot (i.e., if Raft has processed entries after the
+snapshot's lastIncludedTerm/lastIncludedIndex). This is because
+Raft may handle other RPCs and send messages on the applyCh after
+it handled the InstallSnapshot RPC, and before CondInstallSnapshot
+was invoked by the service. It is not OK for Raft to go back to an
+older snapshot, so older snapshots must be refused.
+
+This is just to install the snapshot for the same state in which
+Raft received the RPC call for Snapshot.
+
+If the snapshot is recent, then Raft should trim its log, persist
+the new state, return true, and the service should switch to the
+snapshot before processing the next message on the applyCh.
+*/
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+	rf.Lock("CondInstallSnapshot::1")
+	defer rf.Unlock("CondInstallSnapshot::1")
+	if rf.lastSnapshotTerm > lastIncludedTerm || rf.lastSnapshotIndex > lastIncludedIndex {
+		return false
+	}
+	return true
+}
+
 /*
 Start
 
@@ -509,10 +677,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	}
 	term = rf.currentTerm
-	index = len(rf.logs)
+	index = len(rf.logs) + rf.lastSnapshotIndex + 1
 	newLog := LogEntry{
 		Cmd:  command,
-		Term: rf.currentTerm,
+		Term: term,
 	}
 	rf.logs = append(rf.logs, newLog)
 	rf.matchIndex[rf.me] = index
@@ -674,109 +842,232 @@ func (rf *Raft) ElectionTicker() {
 	}
 }
 
+/*
+getPrevLogEntries
+
+Gets the prevLogTerm, prevLogIndex, entries which needs to be sent to followers
+in AppendEntries RPC call
+*/
 func (rf *Raft) getPrevLogEntries(idx int) (prevLogTerm int, prevLogIndex int, entries []LogEntry) {
+	log.Printf("[%d] idx: %d, nextIdx: %d, rf.lastSnapshotIndex: %d, len(rf.logs): %d", rf.me, idx, rf.nextIndex[idx], rf.lastSnapshotIndex, len(rf.logs))
 	prevLogIndex = rf.nextIndex[idx] - 1
-	prevLogTerm = rf.logs[prevLogIndex].Term
+	prevLogTerm = rf.lastSnapshotTerm
+	if prevLogIndex > rf.lastSnapshotIndex {
+		prevLogTerm = rf.logs[prevLogIndex-rf.lastSnapshotIndex-1].Term
+	}
 	lastLogTerm, lastLogIdx := rf.lastLogTermIndex()
 	if prevLogIndex >= lastLogIdx {
 		prevLogIndex = lastLogIdx
 		prevLogTerm = lastLogTerm
 		return prevLogTerm, prevLogIndex, nil
 	}
-	for i := prevLogIndex + 1; i < len(rf.logs); i++ {
-		entries = append(entries, rf.logs[i])
+	for i := prevLogIndex + 1; i < len(rf.logs) + rf.lastSnapshotIndex + 1; i++ {
+		entries = append(entries, rf.logs[i-rf.lastSnapshotIndex-1])
 	}
 	return prevLogTerm, prevLogIndex, entries
 }
 
+/*
+sendAppendEntriesToPeer
+
+Sends AppendEntries RPC call to the peers
+Returns true if RPC call completed
+Returns false if RPC call failed or should be retried
+*/
+func (rf *Raft) sendAppendEntriesToPeer(idx int, globalTimeoutTicker *time.Ticker) bool {
+	apiTimeoutTicker := time.NewTicker(100 * time.Millisecond)
+	defer apiTimeoutTicker.Stop()
+	rf.Lock("SendHeartBeat::1")
+	if rf.state != LEADER {
+		rf.Unlock("SendHeartBeat::1")
+		return true
+	}
+	endCh := make(chan bool, 1)
+	var resp AppendEntriesReply
+	prevLogTerm, prevLogIndex, entries := rf.getPrevLogEntries(idx)
+	req := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogTerm:  prevLogTerm,
+		PrevLogIndex: prevLogIndex,
+		Entries:      entries,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.Unlock("SendHeartBeat::1")
+	/*
+		This code segment can get stuck because of RPC call taking too much time to
+		return from the server side. We need to have a timeout here to move the overall heartbeat thread.
+	*/
+	go func() {
+		ok := rf.sendAppendEntries(idx, &req, &resp)
+		endCh <- ok
+	}()
+
+	select {
+	case <-globalTimeoutTicker.C:
+		return true
+	case <-apiTimeoutTicker.C:
+		return false
+	case ok := <-endCh:
+		if ok {
+			break
+		} else {
+			time.Sleep(10 * time.Millisecond)
+			return false
+		}
+	}
+
+	rf.Lock("SendHeartBeat::1")
+	if resp.Term > rf.currentTerm {
+		log.Printf("[%d] Received greater term from: %d", rf.me, idx)
+		rf.currentTerm = resp.Term
+		rf.persist()
+		rf.resetElectionTimer()
+		rf.AppointFollower()
+		rf.Unlock("SendHeartBeat::1")
+		return true
+	}
+
+	if rf.state != LEADER {
+		rf.Unlock("SendHeartBeat::1")
+		return true
+	}
+
+	// We don't want to do any extra work here if we don't need to do it synchronously
+	// as that will delay the processing of heartbeat
+	// We will just send the appropriate signal to some background thread which will
+	// do it asynchronously for this raft node
+	if resp.Success {
+		/*
+			Next Index for the Leader will always be moving forward
+			and will never go backwards. Any response showing NextIdx
+			less than the current nextIndex is old response which can be
+			neglected.
+		*/
+		if rf.nextIndex[idx] < resp.NextIdx {
+			rf.nextIndex[idx] = resp.NextIdx
+			rf.matchIndex[idx] = resp.NextIdx - 1
+		}
+		rf.appendLogCh <- true
+		rf.Unlock("SendHeartBeat::1")
+		return true
+	} else {
+		rf.nextIndex[idx] = max(resp.NextIdx, 1)
+	}
+
+	rf.Unlock("SendHeartBeat::1")
+	return false
+}
+
+/*
+sendInstallSnapshotToPeer
+
+Sends InstallSnapshot to the peer
+Returns true if RPC call completed
+Returns false if RPC call failed or should be retried
+*/
+func (rf *Raft) sendInstallSnapshotToPeer(idx int, globalTimeoutTicker *time.Ticker) bool {
+	apiTimeoutTicker := time.NewTicker(100 * time.Millisecond)
+	defer apiTimeoutTicker.Stop()
+	rf.Lock("sendInstallSnapshotToPeer::1")
+	if rf.state != LEADER {
+		rf.Unlock("sendInstallSnapshotToPeer::1")
+		return true
+	}
+	endCh := make(chan bool, 1)
+	var resp InstallSnapshotReply
+	req := InstallSnapshotArgs{
+		Term:              rf.currentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.lastSnapshotIndex,
+		LastIncludedTerm:  rf.lastSnapshotTerm,
+		Snapshot:          rf.snapshot,
+		LeaderCommit:      rf.commitIndex,
+	}
+	rf.Unlock("sendInstallSnapshotToPeer::1")
+	/*
+		This code segment can get stuck because of RPC call taking too much time to
+		return from the server side. We need to have a timeout here to move the overall heartbeat thread.
+	*/
+	go func() {
+		ok := rf.sendInstallSnapshot(idx, &req, &resp)
+		endCh <- ok
+	}()
+
+	select {
+	case <-globalTimeoutTicker.C:
+		return true
+	case <-apiTimeoutTicker.C:
+		return false
+	case ok := <-endCh:
+		if ok {
+			break
+		} else {
+			time.Sleep(10 * time.Millisecond)
+			return false
+		}
+	}
+
+	rf.Lock("sendInstallSnapshotToPeer::1")
+	if resp.Term > rf.currentTerm {
+		log.Printf("[%d] Received greater term from: %d", rf.me, idx)
+		rf.currentTerm = resp.Term
+		rf.persist()
+		rf.resetElectionTimer()
+		rf.AppointFollower()
+		rf.Unlock("sendInstallSnapshotToPeer::1")
+		return true
+	}
+
+	if rf.state != LEADER {
+		rf.Unlock("sendInstallSnapshotToPeer::1")
+		return true
+	}
+
+	// We don't want to do any extra work here if we don't need to do it synchronously
+	// as that will delay the processing of heartbeat
+	// We will just send the appropriate signal to some background thread which will
+	// do it asynchronously for this raft node
+	/*
+		Next Index for the Leader will always be moving forward
+		and will never go backwards.
+	*/
+	if rf.nextIndex[idx] < req.LastIncludedIndex + 1 {
+		rf.nextIndex[idx] = req.LastIncludedIndex + 1
+		rf.matchIndex[idx] = req.LastIncludedIndex
+	}
+	rf.appendLogCh <- true
+	rf.Unlock("sendInstallSnapshotToPeer::1")
+	return true
+}
+
+/*
+SendHeartBeat
+
+Send the Heartbeat message to all the follower/peer at idx
+*/
 func (rf *Raft) SendHeartBeat(idx int) {
 	globalTimeoutTicker := time.NewTicker(200 * time.Millisecond)
 	apiTimeoutTicker := time.NewTicker(100 * time.Millisecond)
 	defer globalTimeoutTicker.Stop()
 	defer apiTimeoutTicker.Stop()
 	for rf.killed() == false {
-		endCh := make(chan bool, 1)
-		var req AppendEntriesArgs
-		var resp AppendEntriesReply
+		// Check whether it needs to send the snapshot or log entries
 		rf.Lock("SendHeartBeat::1")
 		if rf.state != LEADER {
 			rf.Unlock("SendHeartBeat::1")
 			return
-		}
-		prevLogTerm, prevLogIndex, entries := rf.getPrevLogEntries(idx)
-		req = AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogTerm:  prevLogTerm,
-			PrevLogIndex: prevLogIndex,
-			Entries:      entries,
-			LeaderCommit: rf.commitIndex,
-		}
-		rf.Unlock("SendHeartBeat::1")
-		/*
-			This code segment can get stuck because of RPC call taking too much time to
-			return from the server side. We need to have a timeout here to move the overall heartbeat thread.
-		*/
-		apiTimeoutTicker.Stop()
-		apiTimeoutTicker.Reset(100 * time.Millisecond)
-		go func() {
-			ok := rf.sendAppendEntries(idx, &req, &resp)
-			endCh <- ok
-		}()
-
-		select {
-		case <-globalTimeoutTicker.C:
-			return
-		case <-apiTimeoutTicker.C:
-			continue
-		case ok := <-endCh:
-			if ok {
-				break
-			} else {
-				time.Sleep(10 * time.Millisecond)
-				continue
+		} else if rf.nextIndex[idx] <= rf.lastSnapshotIndex {
+			rf.Unlock("SendHeartBeat::1")
+			if rf.sendInstallSnapshotToPeer(idx, globalTimeoutTicker) {
+				return
 			}
-		}
-
-		rf.Lock("SendHeartBeat::1")
-		if resp.Term > rf.currentTerm {
-			log.Printf("[%d] Received greater term from: %d", rf.me, idx)
-			rf.currentTerm = resp.Term
-			rf.persist()
-			rf.resetElectionTimer()
-			rf.AppointFollower()
-			rf.Unlock("SendHeartBeat::1")
-			return
-		}
-
-		if rf.state != LEADER {
-			rf.Unlock("SendHeartBeat::1")
-			return
-		}
-
-		// We don't want to do any extra work here if we don't need to do it synchronously
-		// as that will delay the processing of heartbeat
-		// We will just send the appropriate signal to some background thread which will
-		// do it asynchronously for this raft node
-		if resp.Success {
-			/*
-				Next Index for the Leader will always be moving forward
-				and will never go backwards. Any response showing NextIdx
-				less than the current nextIndex is old response which can be
-				neglected.
-			*/
-			if rf.nextIndex[idx] < resp.NextIdx {
-				rf.nextIndex[idx] = resp.NextIdx
-				rf.matchIndex[idx] = resp.NextIdx - 1
-			}
-			rf.appendLogCh <- true
-			rf.Unlock("SendHeartBeat::1")
-			return
 		} else {
-			rf.nextIndex[idx] = max(resp.NextIdx, 1)
+			rf.Unlock("SendHeartBeat::1")
+			if rf.sendAppendEntriesToPeer(idx, globalTimeoutTicker) {
+				return
+			}
 		}
-
-		rf.Unlock("SendHeartBeat::1")
 	}
 }
 
@@ -823,15 +1114,27 @@ func (rf *Raft) appendLogs() {
 		select {
 		case <-rf.appendLogCh:
 			rf.Lock("appendLogs::1")
+			var msgs []ApplyMsg
 			oldCommitIdx := rf.commitIndex
+			// See if we need to send the snapshot to the service
+			if rf.installSnapshot {
+				rf.installSnapshot = false
+				msgs = append(msgs, ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      rf.snapshot,
+					SnapshotTerm:  rf.lastSnapshotTerm,
+					SnapshotIndex: rf.lastSnapshotIndex,
+				})
+				rf.commitIndex = max(rf.commitIndex, rf.lastSnapshotIndex)
+			}
 			// Check if commit index is increased
-			for commitIdx := rf.commitIndex + 1; commitIdx < len(rf.logs); commitIdx++ {
+			for commitIdx := rf.commitIndex + 1; commitIdx < len(rf.logs)+rf.lastSnapshotIndex+1; commitIdx++ {
 				cnt := 0
 				for _, nodeCommitIdx := range rf.matchIndex {
 					if nodeCommitIdx >= commitIdx {
 						cnt++
 						if cnt > len(rf.peers)/2 {
-							if rf.currentTerm == rf.logs[commitIdx].Term {
+							if rf.currentTerm == rf.logs[commitIdx-rf.lastSnapshotIndex-1].Term {
 								rf.commitIndex = commitIdx
 							}
 							break
@@ -845,11 +1148,13 @@ func (rf *Raft) appendLogs() {
 			if oldCommitIdx != rf.commitIndex {
 				log.Printf("[%d] Updated Commit Index: %d", rf.me, rf.commitIndex)
 			}
-			var msgs []ApplyMsg
 			for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+				if i <= rf.lastSnapshotIndex {
+					continue
+				}
 				msgs = append(msgs, ApplyMsg{
 					CommandValid: true,
-					Command:      rf.logs[i].Cmd,
+					Command:      rf.logs[i-rf.lastSnapshotIndex-1].Cmd,
 					CommandIndex: i,
 				})
 			}
@@ -858,7 +1163,11 @@ func (rf *Raft) appendLogs() {
 			for _, msg := range msgs {
 				rf.applyCh <- msg
 				rf.Lock("appendLogs::2")
-				rf.lastApplied = msg.CommandIndex
+				if msg.SnapshotValid {
+					rf.lastApplied = max(rf.lastApplied, msg.SnapshotIndex)
+				} else {
+					rf.lastApplied = max(rf.lastApplied, msg.CommandIndex)
+				}
 				rf.Unlock("appendLogs::2")
 			}
 		case <-appendLogTicker.C:
@@ -899,6 +1208,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = nil
 	rf.currentTerm = 0
 	rf.votedFor = -1
+	rf.lastSnapshotIndex = -1
+	rf.lastSnapshotTerm = -1
+	rf.snapshot = []byte{}
 	rf.logs = make([]LogEntry, 1)
 	rf.electionTicker = time.NewTicker(rf.randomElectionDuration())
 	rf.heartBeatTicker = time.NewTicker(HeartbeatTimeout)
