@@ -4,4 +4,4 @@
 - [X] Lab 2A: Raft - Leader Election
 - [x] Lab 2B: Raft - Log
 - [x] Lab 2C: Raft - Persistence
-- [ ] Lab 2D: Raft - Log Compaction
+- [x] Lab 2D: Raft - Log Compaction
